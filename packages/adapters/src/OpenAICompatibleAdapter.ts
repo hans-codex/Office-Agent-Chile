@@ -9,12 +9,20 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
         public readonly provider: string = 'openai'
     ) { }
 
+    private resolveEndpoint(): string {
+        const clean = this.baseUrl.replace(/\/+$/, '');
+        if (clean.endsWith('/chat/completions')) return clean;
+        if (clean.endsWith('/v1') || clean.endsWith('/openai')) {
+            return `${clean}/chat/completions`;
+        }
+        return `${clean}/v1/chat/completions`;
+    }
+
     async complete(request: CompletionRequest): Promise<CompletionResponse> {
         const start = Date.now();
 
-        // Map tools if required
-        const tools = request.tools ? request.tools.map(t => ({
-            type: "function",
+        const tools = request.tools && request.tools.length > 0 ? request.tools.map(t => ({
+            type: 'function',
             function: {
                 name: t.name,
                 description: t.description,
@@ -22,34 +30,54 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
             }
         })) : undefined;
 
-        const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+        const endpoint = this.resolveEndpoint();
+        const headers: Record<string, string> = {
+            'Content-Type': 'application/json'
+        };
+        if (this.apiKey) {
+            headers['Authorization'] = `Bearer ${this.apiKey}`;
+        }
+
+        const bodyPayload: Record<string, any> = {
+            model: request.model,
+            messages: request.messages,
+            temperature: request.temperature ?? 0.7
+        };
+        if (tools) {
+            bodyPayload.tools = tools;
+        }
+
+        const response = await fetch(endpoint, {
             method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${this.apiKey}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: request.model,
-                messages: request.messages,
-                tools,
-                temperature: request.temperature
-            })
+            headers,
+            body: JSON.stringify(bodyPayload)
         });
 
         if (!response.ok) {
-            throw new Error(`OpenAI Error: ${response.statusText}`);
+            const errText = await response.text().catch(() => response.statusText);
+            throw new Error(`${this.provider.toUpperCase()} API Error (${response.status}): ${errText.slice(0, 200)}`);
         }
 
         const data = await response.json();
         const latency = Date.now() - start;
-        const message = data.choices[0].message;
+        const message = data.choices?.[0]?.message || {};
 
         let toolCalls;
         if (message.tool_calls) {
-            toolCalls = message.tool_calls.map((tc: any) => ({
-                name: tc.function.name,
-                params: JSON.parse(tc.function.arguments)
-            }));
+            toolCalls = message.tool_calls.map((tc: any) => {
+                let parsedArgs = {};
+                try {
+                    parsedArgs = typeof tc.function.arguments === 'string'
+                        ? JSON.parse(tc.function.arguments)
+                        : (tc.function.arguments || {});
+                } catch {
+                    parsedArgs = {};
+                }
+                return {
+                    name: tc.function.name,
+                    params: parsedArgs
+                };
+            });
         }
 
         return {

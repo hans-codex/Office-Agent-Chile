@@ -3,6 +3,8 @@ import { Schema, MapSchema, type } from '@colyseus/schema';
 export class AgentState extends Schema {
     @type('string') id: string;
     @type('string') name: string;
+    @type('string') role: string;
+    @type('string') avatar: string;
     @type('number') x: number;
     @type('number') y: number;
     @type('string') direction: 'up' | 'down' | 'left' | 'right';
@@ -14,10 +16,12 @@ export class AgentState extends Schema {
     @type('number') riskLevel: number;
     @type('number') momentum: number;
 
-    constructor(id: string, name: string) {
+    constructor(id: string, name: string, role: string = 'Specialist', avatar: string = 'char_0') {
         super();
         this.id = id;
         this.name = name;
+        this.role = role;
+        this.avatar = avatar;
         this.x = 0;
         this.y = 0;
         this.direction = 'down';
@@ -36,8 +40,8 @@ export class OfficeState extends Schema {
     @type('string') officeTime: string = new Date().toISOString();
     @type('number') timeScale: number = 1;
 
-    createAgent(id: string, name: string) {
-        this.agents.set(id, new AgentState(id, name));
+    createAgent(id: string, name: string, role: string = 'Specialist', avatar: string = 'char_0') {
+        this.agents.set(id, new AgentState(id, name, role, avatar));
     }
 
     removeAgent(id: string) {
