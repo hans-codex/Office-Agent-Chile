@@ -5,6 +5,7 @@ import { SkillDefinition } from '@agent-office/core';
 export class SkillRegistry {
     private skills: Map<string, SkillDefinition> = new Map();
     private skillsDir: string;
+    private extraSkillDirs: string[] = [];
 
     constructor(skillsDir?: string) {
         // Resolve root skills directory whether running from root or packages/server
@@ -16,6 +17,18 @@ export class SkillRegistry {
         ].filter(Boolean) as string[];
 
         this.skillsDir = candidates.find(dir => fs.existsSync(dir)) || path.resolve(process.cwd(), 'skills');
+
+        if (!skillsDir) {
+            const agentSkillCandidates = [
+                path.resolve(process.cwd(), '.agents/skills'),
+                path.resolve(process.cwd(), '../../.agents/skills'),
+                path.resolve(__dirname, '../../../../.agents/skills')
+            ];
+            const foundAgentSkills = agentSkillCandidates.find(dir => fs.existsSync(dir));
+            if (foundAgentSkills) {
+                this.extraSkillDirs.push(foundAgentSkills);
+            }
+        }
     }
 
     public loadFromDisk(): SkillDefinition[] {
@@ -23,17 +36,21 @@ export class SkillRegistry {
             fs.mkdirSync(this.skillsDir, { recursive: true });
         }
 
-        const entries = fs.readdirSync(this.skillsDir, { withFileTypes: true });
-        for (const entry of entries) {
-            if (!entry.isDirectory()) continue;
-            const skillFile = path.join(this.skillsDir, entry.name, 'SKILL.md');
-            if (fs.existsSync(skillFile)) {
-                try {
-                    const raw = fs.readFileSync(skillFile, 'utf-8');
-                    const parsed = this.parseSkillMarkdown(entry.name, raw);
-                    this.skills.set(parsed.id, parsed);
-                } catch (e) {
-                    console.warn(`[SkillRegistry] Failed to parse ${skillFile}:`, e);
+        const dirsToScan = [this.skillsDir, ...this.extraSkillDirs];
+        for (const baseDir of dirsToScan) {
+            if (!fs.existsSync(baseDir)) continue;
+            const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+            for (const entry of entries) {
+                if (!entry.isDirectory()) continue;
+                const skillFile = path.join(baseDir, entry.name, 'SKILL.md');
+                if (fs.existsSync(skillFile)) {
+                    try {
+                        const raw = fs.readFileSync(skillFile, 'utf-8');
+                        const parsed = this.parseSkillMarkdown(entry.name, raw);
+                        this.skills.set(parsed.id, parsed);
+                    } catch (e) {
+                        console.warn(`[SkillRegistry] Failed to parse ${skillFile}:`, e);
+                    }
                 }
             }
         }
