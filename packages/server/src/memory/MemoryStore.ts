@@ -1,6 +1,7 @@
 import { MemoryEntry, SkillDefinition } from '@agent-office/core';
 import fs from 'fs/promises';
 import path from 'path';
+import { PostgresClient } from '../pgClient';
 
 export interface PersistedAgentProfile {
     id: string;
@@ -35,6 +36,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 }
 
 export class MemoryStore {
+    private pgClient?: PostgresClient;
     private db?: any;
     private useJsonFallback = false;
     private jsonPath = './data/office-memory.json';
@@ -57,9 +59,85 @@ export class MemoryStore {
         await fs.writeFile(this.jsonPath, JSON.stringify(this.jsonData, null, 2), 'utf-8');
     }
 
-    async initialize(dbPath: string = './data/office-memory.db') {
-        await fs.mkdir(path.dirname(dbPath), { recursive: true });
-        this.jsonPath = dbPath.replace(/\.db$/i, '.json');
+    async initialize(dbPath?: string) {
+        const targetConn = dbPath || process.env.DATABASE_URL || './data/office-memory.db';
+
+        // 1. Check if PostgreSQL URL is configured (and not an explicit local file path passed by unit tests)
+        if (/^postgres(ql)?:\/\//i.test(targetConn)) {
+            try {
+                const pg = new PostgresClient(targetConn);
+                await pg.initialize();
+                await pg.query(`
+                    CREATE TABLE IF NOT EXISTS memories (
+                        id SERIAL PRIMARY KEY,
+                        agent_id TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        type TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        importance DOUBLE PRECISION NOT NULL DEFAULT 0.5,
+                        embedding TEXT,
+                        session_id TEXT,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id);
+                    CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance DESC);
+
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id SERIAL PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        assigned_to TEXT,
+                        status TEXT DEFAULT 'pending',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        completed_at TIMESTAMPTZ
+                    );
+
+                    CREATE TABLE IF NOT EXISTS office_layout (
+                        id SERIAL PRIMARY KEY,
+                        layout_json TEXT NOT NULL,
+                        name TEXT UNIQUE NOT NULL DEFAULT 'default',
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+
+                    CREATE TABLE IF NOT EXISTS custom_agents (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        avatar TEXT NOT NULL DEFAULT 'char_0',
+                        x INTEGER NOT NULL DEFAULT 10,
+                        y INTEGER NOT NULL DEFAULT 10,
+                        provider TEXT NOT NULL DEFAULT 'gemini',
+                        model TEXT NOT NULL DEFAULT 'gemini-3.1-flash-lite',
+                        system_prompt TEXT NOT NULL,
+                        communication_style TEXT NOT NULL DEFAULT 'technical',
+                        skills_json TEXT NOT NULL DEFAULT '[]',
+                        tools_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+
+                    CREATE TABLE IF NOT EXISTS custom_skills (
+                        id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        category TEXT NOT NULL DEFAULT 'Custom',
+                        instructions TEXT NOT NULL,
+                        recommended_tools_json TEXT NOT NULL DEFAULT '[]',
+                        updated_at TIMESTAMPTZ DEFAULT NOW()
+                    );
+                `);
+                this.pgClient = pg;
+                console.log('[MemoryStore] Connected to PostgreSQL (Supabase)');
+                return;
+            } catch (pgErr: any) {
+                console.warn(`[MemoryStore] PostgreSQL connection warning (${pgErr?.message || pgErr}). Falling back to local store.`);
+            }
+        }
+
+        const localFilePath = /^postgres(ql)?:\/\//i.test(targetConn)
+            ? './data/office-memory.db'
+            : targetConn;
+
+        await fs.mkdir(path.dirname(localFilePath), { recursive: true });
+        this.jsonPath = localFilePath.replace(/\.db$/i, '.json');
 
         try {
             const sqlite3Mod = await import('sqlite3');
@@ -67,7 +145,7 @@ export class MemoryStore {
             const { open } = await import('sqlite');
 
             this.db = await open({
-                filename: dbPath,
+                filename: localFilePath,
                 driver: sqlite3.Database
             });
 
@@ -110,7 +188,7 @@ export class MemoryStore {
                     x INTEGER NOT NULL DEFAULT 10,
                     y INTEGER NOT NULL DEFAULT 10,
                     provider TEXT NOT NULL DEFAULT 'gemini',
-                    model TEXT NOT NULL DEFAULT 'gemini-2.5-flash',
+                    model TEXT NOT NULL DEFAULT 'gemini-3.1-flash-lite',
                     system_prompt TEXT NOT NULL,
                     communication_style TEXT NOT NULL DEFAULT 'technical',
                     skills_json TEXT NOT NULL DEFAULT '[]',
@@ -131,12 +209,10 @@ export class MemoryStore {
 
             try {
                 await this.db.exec('ALTER TABLE memories ADD COLUMN embedding TEXT');
-            } catch {
-                // Column already exists
-            }
+            } catch {}
 
-            console.log('[MemoryStore] SQLite initialized at', dbPath);
-        } catch (err: any) {
+            console.log('[MemoryStore] SQLite initialized at', localFilePath);
+        } catch {
             this.useJsonFallback = true;
             try {
                 const raw = await fs.readFile(this.jsonPath, 'utf-8');
@@ -158,6 +234,40 @@ export class MemoryStore {
     // --- Agent Profile Persistence ---
 
     async saveAgentProfile(profile: PersistedAgentProfile): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query(
+                `INSERT INTO custom_agents (id, name, role, avatar, x, y, provider, model, system_prompt, communication_style, skills_json, tools_json, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    role = EXCLUDED.role,
+                    avatar = EXCLUDED.avatar,
+                    x = EXCLUDED.x,
+                    y = EXCLUDED.y,
+                    provider = EXCLUDED.provider,
+                    model = EXCLUDED.model,
+                    system_prompt = EXCLUDED.system_prompt,
+                    communication_style = EXCLUDED.communication_style,
+                    skills_json = EXCLUDED.skills_json,
+                    tools_json = EXCLUDED.tools_json,
+                    updated_at = NOW()`,
+                [
+                    profile.id,
+                    profile.name,
+                    profile.role,
+                    profile.avatar,
+                    profile.x,
+                    profile.y,
+                    profile.provider,
+                    profile.model,
+                    profile.systemPrompt,
+                    profile.communicationStyle,
+                    JSON.stringify(profile.skills || []),
+                    JSON.stringify(profile.allowedTools || [])
+                ]
+            );
+            return;
+        }
         if (this.useJsonFallback) {
             this.jsonData.agents[profile.id] = profile;
             await this.flushJson();
@@ -198,6 +308,23 @@ export class MemoryStore {
     }
 
     async loadAgentProfiles(): Promise<PersistedAgentProfile[]> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query('SELECT * FROM custom_agents ORDER BY updated_at ASC');
+            return res.rows.map((r: any) => ({
+                id: r.id,
+                name: r.name,
+                role: r.role,
+                avatar: r.avatar || 'char_0',
+                x: Number(r.x ?? 10),
+                y: Number(r.y ?? 10),
+                provider: r.provider || 'gemini',
+                model: r.model || 'gemini-3.1-flash-lite',
+                systemPrompt: r.system_prompt || '',
+                communicationStyle: (r.communication_style || 'casual') as any,
+                skills: JSON.parse(r.skills_json || '[]'),
+                allowedTools: JSON.parse(r.tools_json || '[]')
+            }));
+        }
         if (this.useJsonFallback) {
             return Object.values(this.jsonData.agents);
         }
@@ -211,7 +338,7 @@ export class MemoryStore {
             x: Number(r.x ?? 10),
             y: Number(r.y ?? 10),
             provider: r.provider || 'gemini',
-            model: r.model || 'gemini-2.5-flash',
+            model: r.model || 'gemini-3.1-flash-lite',
             systemPrompt: r.system_prompt || '',
             communicationStyle: r.communication_style || 'casual',
             skills: JSON.parse(r.skills_json || '[]'),
@@ -220,6 +347,10 @@ export class MemoryStore {
     }
 
     async deleteAgentProfile(id: string): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query('DELETE FROM custom_agents WHERE id = $1', [id]);
+            return;
+        }
         if (this.useJsonFallback) {
             delete this.jsonData.agents[id];
             await this.flushJson();
@@ -232,6 +363,28 @@ export class MemoryStore {
     // --- Custom Skill Persistence ---
 
     async saveCustomSkill(skill: SkillDefinition): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query(
+                `INSERT INTO custom_skills (id, name, description, category, instructions, recommended_tools_json, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    description = EXCLUDED.description,
+                    category = EXCLUDED.category,
+                    instructions = EXCLUDED.instructions,
+                    recommended_tools_json = EXCLUDED.recommended_tools_json,
+                    updated_at = NOW()`,
+                [
+                    skill.id,
+                    skill.name,
+                    skill.description,
+                    skill.category || 'Custom',
+                    skill.instructions,
+                    JSON.stringify(skill.recommendedTools || [])
+                ]
+            );
+            return;
+        }
         if (this.useJsonFallback) {
             this.jsonData.skills[skill.id] = skill;
             await this.flushJson();
@@ -260,6 +413,18 @@ export class MemoryStore {
     }
 
     async loadCustomSkills(): Promise<SkillDefinition[]> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query('SELECT * FROM custom_skills ORDER BY updated_at ASC');
+            return res.rows.map((r: any) => ({
+                id: r.id,
+                name: r.name,
+                description: r.description,
+                category: r.category || 'Custom',
+                instructions: r.instructions,
+                recommendedTools: JSON.parse(r.recommended_tools_json || '[]'),
+                source: 'custom' as const
+            }));
+        }
         if (this.useJsonFallback) {
             return Object.values(this.jsonData.skills);
         }
@@ -295,6 +460,13 @@ export class MemoryStore {
     // --- Memory Operations ---
 
     async saveMemory(agentId: string, entry: MemoryEntry, sessionId?: string): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query(
+                'INSERT INTO memories (agent_id, content, type, timestamp, importance, embedding, session_id) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                [agentId, entry.content, entry.type, entry.timestamp, entry.importance, null, sessionId || null]
+            );
+            return;
+        }
         if (this.useJsonFallback) {
             this.jsonData.memories.push({
                 agent_id: agentId,
@@ -329,6 +501,18 @@ export class MemoryStore {
     }
 
     async loadMemories(agentId: string, limit: number = 20): Promise<MemoryEntry[]> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query(
+                'SELECT content, type, timestamp, importance FROM memories WHERE agent_id = $1 ORDER BY importance DESC, created_at DESC LIMIT $2',
+                [agentId, limit]
+            );
+            return res.rows.map((r: any) => ({
+                content: r.content,
+                type: r.type,
+                timestamp: r.timestamp,
+                importance: Number(r.importance ?? 0.5)
+            }));
+        }
         if (this.useJsonFallback) {
             return this.jsonData.memories
                 .filter(m => m.agent_id === agentId)
@@ -355,7 +539,7 @@ export class MemoryStore {
     }
 
     async semanticSearch(agentId: string, query: string, topK: number = 5): Promise<MemoryEntry[]> {
-        if (this.useJsonFallback || !this.db) return this.loadMemories(agentId, topK);
+        if (this.pgClient || this.useJsonFallback || !this.db) return this.loadMemories(agentId, topK);
         const queryEmbedding = await this.generateEmbedding(query);
         if (!queryEmbedding) return this.loadMemories(agentId, topK);
 
@@ -381,6 +565,13 @@ export class MemoryStore {
     // --- Task Operations ---
 
     async createTask(title: string, assignedTo?: string): Promise<number> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query(
+                "INSERT INTO tasks (title, assigned_to, status) VALUES ($1, $2, 'in_progress') RETURNING id",
+                [title, assignedTo || null]
+            );
+            return Number(res.rows[0]?.id || Date.now());
+        }
         if (this.useJsonFallback) {
             const id = Date.now();
             this.jsonData.tasks.unshift({
@@ -402,6 +593,13 @@ export class MemoryStore {
     }
 
     async getTasks(): Promise<any[]> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 50');
+            return res.rows.map((r: any) => ({
+                ...r,
+                id: Number(r.id)
+            }));
+        }
         if (this.useJsonFallback) {
             return this.jsonData.tasks.slice(0, 50);
         }
@@ -410,6 +608,10 @@ export class MemoryStore {
     }
 
     async assignTask(taskId: number, agentId: string): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query("UPDATE tasks SET assigned_to = $1, status = 'in_progress' WHERE id = $2", [agentId, taskId]);
+            return;
+        }
         if (this.useJsonFallback) {
             const task = this.jsonData.tasks.find(t => t.id === taskId);
             if (task) {
@@ -424,6 +626,10 @@ export class MemoryStore {
     }
 
     async completeTask(taskId: number): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query("UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE id = $1", [taskId]);
+            return;
+        }
         if (this.useJsonFallback) {
             const task = this.jsonData.tasks.find(t => t.id === taskId);
             if (task) {
@@ -438,6 +644,10 @@ export class MemoryStore {
     }
 
     async completeTaskByTitle(title: string): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query("UPDATE tasks SET status = 'completed', completed_at = NOW() WHERE title = $1", [title]);
+            return;
+        }
         if (this.useJsonFallback) {
             const task = this.jsonData.tasks.find(t => t.title === title);
             if (task) {
@@ -454,6 +664,14 @@ export class MemoryStore {
     // --- Layout Operations ---
 
     async saveLayout(name: string, layoutJson: string): Promise<void> {
+        if (this.pgClient) {
+            await this.pgClient.query(
+                `INSERT INTO office_layout (name, layout_json, updated_at) VALUES ($1, $2, NOW())
+                 ON CONFLICT(name) DO UPDATE SET layout_json = EXCLUDED.layout_json, updated_at = NOW()`,
+                [name, layoutJson]
+            );
+            return;
+        }
         if (this.useJsonFallback) {
             this.jsonData.layouts[name] = JSON.parse(layoutJson);
             await this.flushJson();
@@ -469,6 +687,10 @@ export class MemoryStore {
     }
 
     async loadLayout(name: string = 'default'): Promise<any | null> {
+        if (this.pgClient) {
+            const res = await this.pgClient.query('SELECT layout_json FROM office_layout WHERE name = $1', [name]);
+            return res.rows[0] ? JSON.parse(res.rows[0].layout_json) : null;
+        }
         if (this.useJsonFallback) {
             return this.jsonData.layouts[name] || null;
         }
@@ -478,6 +700,7 @@ export class MemoryStore {
     }
 
     async close(): Promise<void> {
+        if (this.pgClient) await this.pgClient.close();
         if (this.db) await this.db.close();
     }
 }
