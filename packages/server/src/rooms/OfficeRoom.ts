@@ -97,7 +97,7 @@ export class OfficeRoom extends Room<OfficeState> {
         const skillDefs = this.skillRegistry.getMany(skills);
 
         const provider = (profile.provider || 'gemini') as LLMProviderType;
-        const model = profile.model || (DEFAULT_MODELS[profile.provider] || 'gemini-2.5-flash');
+        const model = profile.model || (DEFAULT_MODELS[profile.provider] || 'gemini-3.8-flash');
 
         const coreAgent = new Agent({
             id: profile.id,
@@ -175,6 +175,8 @@ export class OfficeRoom extends Room<OfficeState> {
             }
         } else {
             console.log('[OfficeRoom] No persisted profiles found. Seeding default agents Alice & Bob...');
+            const defaultProvider = process.env.DEFAULT_LLM_PROVIDER || 'gemini';
+            const defaultModel = process.env.DEFAULT_LLM_MODEL || DEFAULT_MODELS[defaultProvider] || 'gemini-3.8-flash';
             const defaultAlice: PersistedAgentProfile = {
                 id: 'alice',
                 name: 'Alice',
@@ -182,8 +184,8 @@ export class OfficeRoom extends Room<OfficeState> {
                 avatar: 'char_0',
                 x: 10,
                 y: 10,
-                provider: 'ollama',
-                model: 'llama3.2:latest',
+                provider: defaultProvider,
+                model: defaultModel,
                 systemPrompt: 'You are Alice, an Engineer in a virtual office. Be social, do your work, and collaborate with colleagues. Keep thoughts SHORT.',
                 communicationStyle: 'technical',
                 skills: ['fullstack-engineer'],
@@ -196,8 +198,8 @@ export class OfficeRoom extends Room<OfficeState> {
                 avatar: 'char_1',
                 x: 20,
                 y: 15,
-                provider: 'ollama',
-                model: 'llama3.2:latest',
+                provider: defaultProvider,
+                model: defaultModel,
                 systemPrompt: 'You are Bob, a Product Manager in a virtual office. Be social, coordinate tasks, and collaborate with colleagues. Keep thoughts SHORT.',
                 communicationStyle: 'casual',
                 skills: ['product-manager'],
@@ -289,7 +291,7 @@ export class OfficeRoom extends Room<OfficeState> {
             const x = typeof message.x === 'number' ? message.x : (10 + (this.coreAgents.size * 5) % 25);
             const y = typeof message.y === 'number' ? message.y : (10 + (this.coreAgents.size * 4) % 20);
             const provider = message.provider || 'gemini';
-            const model = message.model || (DEFAULT_MODELS[provider] || 'gemini-2.5-flash');
+            const model = message.model || (DEFAULT_MODELS[provider] || 'gemini-3.8-flash');
             const skills = Array.isArray(message.skills) ? message.skills : [];
             const allowedTools = Array.isArray(message.allowedTools) && message.allowedTools.length > 0
                 ? message.allowedTools

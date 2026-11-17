@@ -38,8 +38,12 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
             headers['Authorization'] = `Bearer ${this.apiKey}`;
         }
 
+        const resolvedModel = (this.provider === 'gemini' && (!request.model || request.model === 'gemini-2.5-flash'))
+            ? 'gemini-3.8-flash'
+            : request.model;
+
         const bodyPayload: Record<string, any> = {
-            model: request.model,
+            model: resolvedModel,
             messages: request.messages,
             temperature: request.temperature ?? 0.7
         };

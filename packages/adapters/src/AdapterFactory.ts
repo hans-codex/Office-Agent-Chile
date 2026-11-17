@@ -12,9 +12,9 @@ export interface ProviderCredentials {
 }
 
 export const DEFAULT_MODELS: Record<string, string> = {
-    gemini: 'gemini-2.5-flash',
+    gemini: 'gemini-3.8-flash',
     openai: 'gpt-4o-mini',
-    openrouter: 'google/gemini-2.5-flash',
+    openrouter: 'google/gemini-3.8-flash',
     ollama: 'llama3.2:latest'
 };
 
