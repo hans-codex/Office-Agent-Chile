@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import express from 'express';
 import { Server } from 'colyseus';
 import { createServer } from 'http';
@@ -5,6 +7,32 @@ import { OfficeRoom } from './rooms/OfficeRoom';
 import { SkillRegistry } from './skills/SkillRegistry';
 import { ToolRegistry } from './tools/ToolRegistry';
 import { MemoryStore } from './memory/MemoryStore';
+
+// Load .env from workspace root or current directory automatically
+(function loadDotEnv() {
+    const candidates = [
+        path.resolve(process.cwd(), '.env'),
+        path.resolve(process.cwd(), '../../.env'),
+        path.resolve(__dirname, '../../../.env')
+    ];
+    for (const envPath of candidates) {
+        if (fs.existsSync(envPath)) {
+            const lines = fs.readFileSync(envPath, 'utf-8').split(/\r?\n/);
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed.startsWith('#')) continue;
+                const eqIdx = trimmed.indexOf('=');
+                if (eqIdx === -1) continue;
+                const key = trimmed.slice(0, eqIdx).trim();
+                const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, '');
+                if (key && process.env[key] === undefined) {
+                    process.env[key] = val;
+                }
+            }
+            break;
+        }
+    }
+})();
 
 // Setup Express
 const app = express();
