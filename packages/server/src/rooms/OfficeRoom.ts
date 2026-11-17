@@ -97,7 +97,7 @@ export class OfficeRoom extends Room<OfficeState> {
         const skillDefs = this.skillRegistry.getMany(skills);
 
         const provider = (profile.provider || 'gemini') as LLMProviderType;
-        const model = profile.model || (DEFAULT_MODELS[profile.provider] || 'gemini-3.8-flash');
+        const model = profile.model || (DEFAULT_MODELS[profile.provider] || 'gemini-3.1-flash-lite');
 
         const coreAgent = new Agent({
             id: profile.id,
@@ -176,7 +176,7 @@ export class OfficeRoom extends Room<OfficeState> {
         } else {
             console.log('[OfficeRoom] No persisted profiles found. Seeding default agents Alice & Bob...');
             const defaultProvider = process.env.DEFAULT_LLM_PROVIDER || 'gemini';
-            const defaultModel = process.env.DEFAULT_LLM_MODEL || DEFAULT_MODELS[defaultProvider] || 'gemini-3.8-flash';
+            const defaultModel = process.env.DEFAULT_LLM_MODEL || DEFAULT_MODELS[defaultProvider] || 'gemini-3.1-flash-lite';
             const defaultAlice: PersistedAgentProfile = {
                 id: 'alice',
                 name: 'Alice',
@@ -223,8 +223,40 @@ export class OfficeRoom extends Room<OfficeState> {
         });
 
         this.onMessage('chat', (client, message) => {
-            console.log(`Chat from ${client.sessionId}: ${message.text}`);
-            this.broadcast('chat', { sender: 'User', text: message.text });
+            const text = String(message?.text || '').trim();
+            if (!text) return;
+            console.log(`Chat from ${client.sessionId}: ${text}`);
+            this.broadcast('chat', { sender: 'User', text });
+
+            // Deliver user chat message to mentioned agent(s), or all agents if none specified
+            const lower = text.toLowerCase();
+            let deliveredToSpecific = false;
+            this.coreAgents.forEach((agent, id) => {
+                if (lower.includes(agent.config.name.toLowerCase())) {
+                    agent.receiveMessage({
+                        from: 'User',
+                        to: agent.config.name,
+                        content: text,
+                        timestamp: this.state.officeTime
+                    });
+                    this.thinkingLocks.set(id, false);
+                    deliveredToSpecific = true;
+                }
+            });
+
+            if (!deliveredToSpecific) {
+                this.coreAgents.forEach((agent, id) => {
+                    agent.receiveMessage({
+                        from: 'User',
+                        to: agent.config.name,
+                        content: text,
+                        timestamp: this.state.officeTime
+                    });
+                });
+                // Unlock the first available agent so they reply immediately
+                const responderId = this.autoAssignAgent();
+                this.thinkingLocks.set(responderId, false);
+            }
         });
 
         this.onMessage('start-scenario', (client, message) => {
@@ -252,6 +284,13 @@ export class OfficeRoom extends Room<OfficeState> {
                 agent.currentTask = title;
                 agentState.currentTask = title;
                 agentState.action = 'work';
+                agent.receiveMessage({
+                    from: 'User',
+                    to: agentState.name,
+                    content: `New task assigned to you: "${title}". Please respond or execute it.`,
+                    timestamp: this.state.officeTime
+                });
+                this.thinkingLocks.set(targetId, false);
 
                 // Persist task
                 this.memoryStore.createTask(title, targetId);
@@ -291,7 +330,7 @@ export class OfficeRoom extends Room<OfficeState> {
             const x = typeof message.x === 'number' ? message.x : (10 + (this.coreAgents.size * 5) % 25);
             const y = typeof message.y === 'number' ? message.y : (10 + (this.coreAgents.size * 4) % 20);
             const provider = message.provider || 'gemini';
-            const model = message.model || (DEFAULT_MODELS[provider] || 'gemini-3.8-flash');
+            const model = message.model || (DEFAULT_MODELS[provider] || 'gemini-3.1-flash-lite');
             const skills = Array.isArray(message.skills) ? message.skills : [];
             const allowedTools = Array.isArray(message.allowedTools) && message.allowedTools.length > 0
                 ? message.allowedTools
@@ -504,9 +543,9 @@ export class OfficeRoom extends Room<OfficeState> {
                         agentState.thought = decision.thought;
                     }
 
-                    // ─── HANDLE TALK ACTION (Agent-to-Agent) ───
+                    // ─── HANDLE TALK ACTION (Agent-to-Agent or Agent-to-User) ───
                     if (decision.action === 'talk' && decision.message) {
-                        const targetName = decision.target || '';
+                        const targetName = (decision.target || '').trim();
                         let targetId = '';
                         this.coreAgents.forEach((a, aId) => {
                             if (a.config.name.toLowerCase() === targetName.toLowerCase()) targetId = aId;
@@ -538,6 +577,26 @@ export class OfficeRoom extends Room<OfficeState> {
                             // Save conversation memory
                             await this.memoryStore.saveMemory(id, {
                                 content: `Said to ${targetAgent.config.name}: "${decision.message}"`,
+                                type: 'conversation',
+                                timestamp: this.state.officeTime,
+                                importance: 0.7
+                            }, this.sessionId);
+                        } else {
+                            // Talking to User or broadcasting to the office
+                            const recipientLabel = targetName && targetName.toLowerCase() !== 'user' ? ` (to ${targetName})` : '';
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `💬${recipientLabel}: ${decision.message}`
+                            });
+                            agentState.thought = decision.message.slice(0, 140);
+                            this.emitHighlight(
+                                'conversation',
+                                `${coreAgent.config.name} replied`,
+                                decision.message.slice(0, 120),
+                                id
+                            );
+                            await this.memoryStore.saveMemory(id, {
+                                content: `Replied to ${targetName || 'User'}: "${decision.message}"`,
                                 type: 'conversation',
                                 timestamp: this.state.officeTime,
                                 importance: 0.7

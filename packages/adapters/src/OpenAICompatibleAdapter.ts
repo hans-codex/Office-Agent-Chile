@@ -1,5 +1,11 @@
 import { InferenceAdapter, CompletionRequest, CompletionResponse } from '@agent-office/core';
 
+const GEMINI_FALLBACK_MODELS = [
+    'gemini-3.1-flash-lite',
+    'gemini-3.5-flash-lite',
+    'gemini-3.8-flash'
+];
+
 export class OpenAICompatibleAdapter implements InferenceAdapter {
     public readonly isLocal = false;
 
@@ -16,6 +22,16 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
             return `${clean}/chat/completions`;
         }
         return `${clean}/v1/chat/completions`;
+    }
+
+    private getModelCandidates(requestedModel: string): string[] {
+        if (this.provider !== 'gemini') {
+            return [requestedModel];
+        }
+        const primary = (!requestedModel || requestedModel === 'gemini-2.5-flash')
+            ? 'gemini-3.1-flash-lite'
+            : requestedModel;
+        return Array.from(new Set([primary, ...GEMINI_FALLBACK_MODELS]));
     }
 
     async complete(request: CompletionRequest): Promise<CompletionResponse> {
@@ -38,60 +54,68 @@ export class OpenAICompatibleAdapter implements InferenceAdapter {
             headers['Authorization'] = `Bearer ${this.apiKey}`;
         }
 
-        const resolvedModel = (this.provider === 'gemini' && (!request.model || request.model === 'gemini-2.5-flash'))
-            ? 'gemini-3.8-flash'
-            : request.model;
+        const candidates = this.getModelCandidates(request.model);
+        let lastError = '';
 
-        const bodyPayload: Record<string, any> = {
-            model: resolvedModel,
-            messages: request.messages,
-            temperature: request.temperature ?? 0.7
-        };
-        if (tools) {
-            bodyPayload.tools = tools;
-        }
+        for (const candidateModel of candidates) {
+            const bodyPayload: Record<string, any> = {
+                model: candidateModel,
+                messages: request.messages,
+                temperature: request.temperature ?? 0.7
+            };
+            if (tools) {
+                bodyPayload.tools = tools;
+            }
 
-        const response = await fetch(endpoint, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify(bodyPayload)
-        });
-
-        if (!response.ok) {
-            const errText = await response.text().catch(() => response.statusText);
-            throw new Error(`${this.provider.toUpperCase()} API Error (${response.status}): ${errText.slice(0, 200)}`);
-        }
-
-        const data = await response.json();
-        const latency = Date.now() - start;
-        const message = data.choices?.[0]?.message || {};
-
-        let toolCalls;
-        if (message.tool_calls) {
-            toolCalls = message.tool_calls.map((tc: any) => {
-                let parsedArgs = {};
-                try {
-                    parsedArgs = typeof tc.function.arguments === 'string'
-                        ? JSON.parse(tc.function.arguments)
-                        : (tc.function.arguments || {});
-                } catch {
-                    parsedArgs = {};
-                }
-                return {
-                    name: tc.function.name,
-                    params: parsedArgs
-                };
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(bodyPayload)
             });
+
+            if (!response.ok) {
+                const errText = await response.text().catch(() => response.statusText);
+                lastError = `${this.provider.toUpperCase()} API Error (${response.status} on ${candidateModel}): ${errText.slice(0, 200)}`;
+                // Retry next fallback candidate on 404 (deprecated model), 429 (rate limit), or 503 (high demand)
+                if (this.provider === 'gemini' && (response.status === 404 || response.status === 429 || response.status === 503)) {
+                    continue;
+                }
+                throw new Error(lastError);
+            }
+
+            const data = await response.json();
+            const latency = Date.now() - start;
+            const message = data.choices?.[0]?.message || {};
+
+            let toolCalls;
+            if (message.tool_calls) {
+                toolCalls = message.tool_calls.map((tc: any) => {
+                    let parsedArgs = {};
+                    try {
+                        parsedArgs = typeof tc.function.arguments === 'string'
+                            ? JSON.parse(tc.function.arguments)
+                            : (tc.function.arguments || {});
+                    } catch {
+                        parsedArgs = {};
+                    }
+                    return {
+                        name: tc.function.name,
+                        params: parsedArgs
+                    };
+                });
+            }
+
+            return {
+                content: message.content || '',
+                toolCalls,
+                usage: {
+                    prompt: data.usage?.prompt_tokens || 0,
+                    completion: data.usage?.completion_tokens || 0
+                },
+                latency
+            };
         }
 
-        return {
-            content: message.content || '',
-            toolCalls,
-            usage: {
-                prompt: data.usage?.prompt_tokens || 0,
-                completion: data.usage?.completion_tokens || 0
-            },
-            latency
-        };
+        throw new Error(lastError || `${this.provider.toUpperCase()} API request failed.`);
     }
 }

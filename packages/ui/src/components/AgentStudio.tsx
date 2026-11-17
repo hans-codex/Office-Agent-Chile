@@ -38,7 +38,7 @@ const PROVIDER_OPTIONS = ['gemini', 'openai', 'openrouter', 'ollama'] as const;
 const STYLE_OPTIONS = ['technical', 'creative', 'casual', 'formal'] as const;
 
 const DEFAULT_MODELS: Record<string, string> = {
-    gemini: 'gemini-3.8-flash',
+    gemini: 'gemini-3.1-flash-lite',
     openai: 'gpt-4o-mini',
     openrouter: 'deepseek/deepseek-chat',
     ollama: 'llama3.2:latest'
