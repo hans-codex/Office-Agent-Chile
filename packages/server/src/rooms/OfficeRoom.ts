@@ -1,9 +1,11 @@
 import { Room, Client } from 'colyseus';
 import { OfficeState } from '../schema/OfficeState';
-import { Agent, Office, OfficeConfig, ConversationMessage } from '@agent-office/core';
-import { OllamaAdapter } from '@agent-office/adapters';
-import { ToolExecutor } from '../tools/ToolExecutor';
-import { MemoryStore } from '../memory/MemoryStore';
+import { Agent, Office, OfficeConfig, ConversationMessage, ToolDefinition, SkillDefinition, LLMProviderType } from '@agent-office/core';
+import { AdapterFactory, DEFAULT_MODELS, OllamaAdapter } from '@agent-office/adapters';
+import { ToolExecutor, ToolResult } from '../tools/ToolExecutor';
+import { MemoryStore, PersistedAgentProfile } from '../memory/MemoryStore';
+import { SkillRegistry } from '../skills/SkillRegistry';
+import { ToolRegistry } from '../tools/ToolRegistry';
 
 interface HighlightEvent {
     type: string;
@@ -34,6 +36,9 @@ export class OfficeRoom extends Room<OfficeState> {
     private hireCount = 0; // Counter for generating unique IDs
     private toolExecutor = new ToolExecutor();
     private memoryStore = new MemoryStore();
+    private skillRegistry = new SkillRegistry();
+    private toolRegistry = new ToolRegistry();
+    private agentProfiles: Map<string, PersistedAgentProfile> = new Map();
     private sessionId = `session_${Date.now()}`;
     private currentScenario = 'Free Play';
     private highlights: HighlightEvent[] = [];
@@ -64,12 +69,92 @@ export class OfficeRoom extends Room<OfficeState> {
         return OfficeRoom.activeRoom;
     }
 
+    public getSkills(): SkillDefinition[] {
+        return this.skillRegistry.getAll();
+    }
+
+    public getTools(): ToolDefinition[] {
+        return this.toolRegistry.getAll();
+    }
+
+    public getAgentProfiles(): PersistedAgentProfile[] {
+        return Array.from(this.agentProfiles.values());
+    }
+
+    private async spawnAgentFromProfile(profile: PersistedAgentProfile) {
+        this.state.createAgent(profile.id, profile.name, profile.role, profile.avatar || 'char_0');
+        const state = this.state.agents.get(profile.id);
+        if (state) {
+            state.x = profile.x;
+            state.y = profile.y;
+        }
+
+        const allowedTools = Array.isArray(profile.allowedTools) && profile.allowedTools.length > 0
+            ? profile.allowedTools
+            : ['code_execute', 'read_file', 'write_file', 'list_files', 'complete_task'];
+        const skills = Array.isArray(profile.skills) ? profile.skills : [];
+        const allowedToolDefs = this.toolRegistry.getMany(allowedTools);
+        const skillDefs = this.skillRegistry.getMany(skills);
+
+        const provider = (profile.provider || 'gemini') as LLMProviderType;
+        const model = profile.model || (DEFAULT_MODELS[profile.provider] || 'gemini-2.5-flash');
+
+        const coreAgent = new Agent({
+            id: profile.id,
+            name: profile.name,
+            role: profile.role,
+            avatar: profile.avatar || 'char_0',
+            inference: {
+                provider,
+                model,
+                systemPrompt: profile.systemPrompt || `You are ${profile.name}, a ${profile.role} in a virtual office. Be social, do your work, and collaborate with colleagues. Keep thoughts SHORT.`,
+                tools: allowedToolDefs
+            },
+            personality: {
+                traits: { openness: 0.8, conscientiousness: 0.9, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.1 },
+                communicationStyle: profile.communicationStyle || (profile.role === 'Engineer' ? 'technical' : 'casual'),
+                workHours: { start: '09:00', end: '17:00' },
+                breakFrequency: 120
+            },
+            capabilities: allowedToolDefs.map(t => ({ name: t.name, description: t.description })),
+            skills: skillDefs,
+            allowedTools,
+            memory: { shortTermLimit: 50 }
+        });
+
+        const adapter = AdapterFactory.createForAgent(coreAgent.config.inference);
+        coreAgent.setInferenceAdapter(adapter);
+        await coreAgent.initialize();
+
+        // Load persistent memories from previous sessions
+        const previousMemories = await this.memoryStore.loadMemories(profile.id, 20);
+        if (previousMemories.length > 0) {
+            coreAgent.loadMemories(previousMemories);
+            console.log(`[${profile.name}] Loaded ${previousMemories.length} memories from previous sessions`);
+        }
+
+        this.coreAgents.set(profile.id, coreAgent);
+        this.thinkingLocks.set(profile.id, false);
+        this.agentProfiles.set(profile.id, profile);
+
+        if (!this.furnitureTargets[`${profile.id}-desk`]) {
+            this.furnitureTargets[`${profile.id}-desk`] = { x: profile.x, y: profile.y, type: 'desk' };
+        }
+    }
+
     async onCreate(options: any) {
         OfficeRoom.activeRoom = this;
         this.setState(new OfficeState());
 
         // Initialize memory store
-        await this.memoryStore.initialize();
+        await this.memoryStore.initialize(options?.dbPath);
+
+        // Initialize skills and tools catalogs
+        this.skillRegistry.loadFromDisk();
+        const customSkills = await this.memoryStore.loadCustomSkills();
+        for (const s of customSkills) {
+            this.skillRegistry.registerSkill(s, false);
+        }
 
         const config: OfficeConfig = {
             name: options.name || 'Startup HQ',
@@ -81,51 +166,50 @@ export class OfficeRoom extends Room<OfficeState> {
         };
         this.office = new Office(config);
 
-        // Setup Core Agents with AI capabilities
-        const setupCoreAgent = async (id: string, name: string, role: string, x: number, y: number) => {
-            this.state.createAgent(id, name);
-            const state = this.state.agents.get(id);
-            if (state) { state.x = x; state.y = y; }
-
-            const coreAgent = new Agent({
-                id, name, role, avatar: 'sprite.png',
-                inference: {
-                    provider: 'ollama',
-                    model: 'llama3.2:latest',
-                    systemPrompt: `You are ${name}, a ${role} in a virtual office. Be social, do your work, and collaborate with colleagues. Keep thoughts SHORT.`,
-                },
-                personality: {
-                    traits: { openness: 0.8, conscientiousness: 0.9, extraversion: 0.6, agreeableness: 0.7, neuroticism: 0.1 },
-                    communicationStyle: role === 'Engineer' ? 'technical' : 'casual',
-                    workHours: { start: '09:00', end: '17:00' },
-                    breakFrequency: 120
-                },
-                capabilities: [
-                    { name: 'code_execute', description: 'Execute JavaScript code' },
-                    { name: 'web_search', description: 'Search the web for information' },
-                    { name: 'write_note', description: 'Write a note or memo' },
-                    { name: 'create_task', description: 'Create a task and assign it to yourself or another agent' },
-                    { name: 'hire_agent', description: 'Hire a new team member (intern, developer, designer). Params: { name: string, role: string }' }
-                ],
-                memory: { shortTermLimit: 50 }
-            });
-
-            coreAgent.setInferenceAdapter(this.ollamaAdapter);
-            await coreAgent.initialize();
-
-            // Load persistent memories from previous sessions
-            const previousMemories = await this.memoryStore.loadMemories(id, 20);
-            if (previousMemories.length > 0) {
-                coreAgent.loadMemories(previousMemories);
-                console.log(`[${name}] Loaded ${previousMemories.length} memories from previous sessions`);
+        // Restore persisted agent profiles or seed default Alice & Bob
+        const persistedProfiles = await this.memoryStore.loadAgentProfiles();
+        if (persistedProfiles && persistedProfiles.length > 0) {
+            console.log(`[OfficeRoom] Restoring ${persistedProfiles.length} persisted agent profiles...`);
+            for (const profile of persistedProfiles) {
+                await this.spawnAgentFromProfile(profile);
             }
+        } else {
+            console.log('[OfficeRoom] No persisted profiles found. Seeding default agents Alice & Bob...');
+            const defaultAlice: PersistedAgentProfile = {
+                id: 'alice',
+                name: 'Alice',
+                role: 'Engineer',
+                avatar: 'char_0',
+                x: 10,
+                y: 10,
+                provider: 'ollama',
+                model: 'llama3.2:latest',
+                systemPrompt: 'You are Alice, an Engineer in a virtual office. Be social, do your work, and collaborate with colleagues. Keep thoughts SHORT.',
+                communicationStyle: 'technical',
+                skills: ['fullstack-engineer'],
+                allowedTools: ['code_execute', 'read_file', 'write_file', 'list_files', 'complete_task']
+            };
+            const defaultBob: PersistedAgentProfile = {
+                id: 'bob',
+                name: 'Bob',
+                role: 'Product Manager',
+                avatar: 'char_1',
+                x: 20,
+                y: 15,
+                provider: 'ollama',
+                model: 'llama3.2:latest',
+                systemPrompt: 'You are Bob, a Product Manager in a virtual office. Be social, coordinate tasks, and collaborate with colleagues. Keep thoughts SHORT.',
+                communicationStyle: 'casual',
+                skills: ['product-manager'],
+                allowedTools: ['web_search', 'write_note', 'create_task', 'complete_task', 'read_file']
+            };
+            await this.spawnAgentFromProfile(defaultAlice);
+            await this.memoryStore.saveAgentProfile(defaultAlice);
 
-            this.coreAgents.set(id, coreAgent);
-            this.thinkingLocks.set(id, false);
-        };
+            await this.spawnAgentFromProfile(defaultBob);
+            await this.memoryStore.saveAgentProfile(defaultBob);
+        }
 
-        await setupCoreAgent('alice', 'Alice', 'Engineer', 10, 10);
-        await setupCoreAgent('bob', 'Bob', 'Product Manager', 20, 15);
         this.rebuildRelationshipGraph();
         const savedLayout = await this.memoryStore.loadLayout('default');
         this.currentLayout = Array.isArray(savedLayout) ? savedLayout : [];
@@ -192,6 +276,178 @@ export class OfficeRoom extends Room<OfficeState> {
             this.currentLayout = layout;
             this.broadcast('layout-sync', { name: layoutName, layout: this.currentLayout });
             this.broadcast('chat', { sender: 'System', text: '✅ Office layout saved!' });
+        });
+
+        // Create dynamic agent
+        this.onMessage('create-agent', async (client, message) => {
+            const id = message.id || (`agent_${(message.name || 'agent').toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now()}`);
+            if (this.coreAgents.has(id)) {
+                client.send('error', { message: `Agent with id ${id} already exists` });
+                return;
+            }
+
+            const x = typeof message.x === 'number' ? message.x : (10 + (this.coreAgents.size * 5) % 25);
+            const y = typeof message.y === 'number' ? message.y : (10 + (this.coreAgents.size * 4) % 20);
+            const provider = message.provider || 'gemini';
+            const model = message.model || (DEFAULT_MODELS[provider] || 'gemini-2.5-flash');
+            const skills = Array.isArray(message.skills) ? message.skills : [];
+            const allowedTools = Array.isArray(message.allowedTools) && message.allowedTools.length > 0
+                ? message.allowedTools
+                : ['code_execute', 'read_file', 'write_file', 'list_files', 'complete_task'];
+
+            const profile: PersistedAgentProfile = {
+                id,
+                name: message.name || 'New Agent',
+                role: message.role || 'Specialist',
+                avatar: message.avatar || 'char_0',
+                x,
+                y,
+                provider,
+                model,
+                systemPrompt: message.systemPrompt || `You are ${message.name || 'New Agent'}, a ${message.role || 'Specialist'} in a virtual office. Collaborate with colleagues and achieve your goals. Keep thoughts SHORT.`,
+                communicationStyle: message.communicationStyle || 'casual',
+                skills,
+                allowedTools
+            };
+
+            await this.spawnAgentFromProfile(profile);
+            await this.memoryStore.saveAgentProfile(profile);
+            this.rebuildRelationshipGraph();
+
+            this.broadcast('agent-profiles-sync', Array.from(this.agentProfiles.values()));
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: `🎉 Welcome ${profile.name} (${profile.role}) to the team!`
+            });
+            this.emitHighlight(
+                'hiring',
+                `${profile.name} joined the office`,
+                `${profile.name} was added as ${profile.role}.`,
+                profile.id
+            );
+        });
+
+        // Update existing agent configuration
+        this.onMessage('update-agent', async (client, message) => {
+            const id = message.id;
+            if (!id || !this.agentProfiles.has(id)) {
+                client.send('error', { message: `Agent ${id} not found.` });
+                return;
+            }
+
+            const profile = this.agentProfiles.get(id)!;
+            if (message.name) profile.name = message.name;
+            if (message.role) profile.role = message.role;
+            if (message.avatar) profile.avatar = message.avatar;
+            if (message.provider) profile.provider = message.provider;
+            if (message.model) profile.model = message.model;
+            if (message.systemPrompt) profile.systemPrompt = message.systemPrompt;
+            if (message.communicationStyle) profile.communicationStyle = message.communicationStyle;
+            if (Array.isArray(message.skills)) profile.skills = message.skills;
+            if (Array.isArray(message.allowedTools)) profile.allowedTools = message.allowedTools;
+
+            const state = this.state.agents.get(id);
+            if (state) {
+                if (message.name) state.name = message.name;
+                if (message.role) state.role = message.role;
+                if (message.avatar) state.avatar = message.avatar;
+            }
+
+            const coreAgent = this.coreAgents.get(id);
+            if (coreAgent) {
+                if (message.name) coreAgent.config.name = message.name;
+                if (message.role) coreAgent.config.role = message.role;
+                if (message.avatar) coreAgent.config.avatar = message.avatar;
+                if (message.communicationStyle) coreAgent.config.personality.communicationStyle = message.communicationStyle;
+
+                if (Array.isArray(message.skills)) {
+                    const skillDefs = this.skillRegistry.getMany(message.skills);
+                    coreAgent.updateSkills(skillDefs);
+                }
+
+                if (Array.isArray(message.allowedTools)) {
+                    const toolDefs = this.toolRegistry.getMany(message.allowedTools);
+                    coreAgent.updateTools(message.allowedTools, toolDefs);
+                }
+
+                if (message.provider || message.model || message.systemPrompt) {
+                    coreAgent.config.inference.provider = profile.provider as LLMProviderType;
+                    coreAgent.config.inference.model = profile.model;
+                    coreAgent.config.inference.systemPrompt = profile.systemPrompt;
+                    coreAgent.setInferenceAdapter(AdapterFactory.createForAgent(coreAgent.config.inference));
+                }
+            }
+
+            await this.memoryStore.saveAgentProfile(profile);
+            this.broadcast('agent-profiles-sync', Array.from(this.agentProfiles.values()));
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: `✏️ Agent ${profile.name} updated.`
+            });
+        });
+
+        // Delete agent
+        this.onMessage('delete-agent', async (client, message) => {
+            const id = message.id;
+            if (!id) return;
+
+            this.state.removeAgent(id);
+            this.coreAgents.delete(id);
+            this.agentProfiles.delete(id);
+            this.thinkingLocks.delete(id);
+            await this.memoryStore.deleteAgentProfile(id);
+            this.rebuildRelationshipGraph();
+
+            this.broadcast('agent-profiles-sync', Array.from(this.agentProfiles.values()));
+            this.broadcast('chat', {
+                sender: '🏢 Office',
+                text: `🗑️ Agent ${id} removed from office.`
+            });
+        });
+
+        // Save custom skill
+        this.onMessage('save-skill', async (client, message) => {
+            if (!message || !message.name) return;
+            const skillDef = this.skillRegistry.registerSkill(message, true);
+            await this.memoryStore.saveCustomSkill(skillDef);
+
+            this.broadcast('skills-sync', this.skillRegistry.getAll());
+            this.broadcast('chat', {
+                sender: '⚡ Skill System',
+                text: `Registered skill: "${skillDef.name}"`
+            });
+        });
+
+        // Complete task manually or via UI
+        this.onMessage('complete-task', async (client, message) => {
+            const { taskId, title, summary } = message || {};
+            if (taskId) {
+                await this.memoryStore.completeTask(Number(taskId));
+            } else if (title) {
+                await this.memoryStore.completeTaskByTitle(String(title));
+            }
+
+            for (const [agentId, agent] of this.coreAgents) {
+                if ((title && agent.currentTask === title) || (!title && !taskId)) {
+                    agent.currentTask = '';
+                    const st = this.state.agents.get(agentId);
+                    if (st) {
+                        st.currentTask = '';
+                        st.action = 'idle';
+                    }
+                }
+            }
+
+            this.broadcast('task-update', {
+                taskId,
+                task: title || 'Task',
+                status: 'completed',
+                summary: summary || 'Completed by user'
+            });
+            this.broadcast('chat', {
+                sender: 'System',
+                text: `✅ Task "${title || taskId || 'Task'}" marked as completed.`
+            });
         });
 
         // Start Simulation Loop
@@ -320,6 +576,41 @@ export class OfficeRoom extends Room<OfficeState> {
                                     targetId
                                 );
                             }
+                        } else if (decision.toolCall.name === 'complete_task') {
+                            const { summary } = decision.toolCall.params || {};
+                            const completedTaskTitle = coreAgent.currentTask || 'Task';
+                            coreAgent.currentTask = '';
+                            agentState.currentTask = '';
+                            agentState.action = 'idle';
+
+                            if (completedTaskTitle) {
+                                await this.memoryStore.completeTaskByTitle(completedTaskTitle);
+                            }
+
+                            this.broadcast('chat', {
+                                sender: coreAgent.config.name,
+                                text: `✅ Completed task "${completedTaskTitle}": ${summary || 'Deliverable ready'}`
+                            });
+                            this.broadcast('task-update', {
+                                agentId: id,
+                                agentName: coreAgent.config.name,
+                                task: completedTaskTitle,
+                                status: 'completed',
+                                summary: summary || ''
+                            });
+                            this.emitHighlight(
+                                'task',
+                                `${coreAgent.config.name} completed work`,
+                                `"${completedTaskTitle}": ${summary || 'Deliverable ready'}`,
+                                id
+                            );
+
+                            coreAgent.addMemory({
+                                content: `Completed task "${completedTaskTitle}". Summary: ${summary || 'Done'}`,
+                                type: 'achievement',
+                                timestamp: this.state.officeTime,
+                                importance: 0.9
+                            });
                         } else if (decision.toolCall.name === 'hire_agent') {
                             // ─── DYNAMIC AGENT HIRING ───
                             const hireParams = decision.toolCall.params;
@@ -332,40 +623,41 @@ export class OfficeRoom extends Room<OfficeState> {
                                 const spawnX = 20;
                                 const spawnY = 2;
 
-                                this.state.createAgent(hireId, hireName);
-                                const hireState = this.state.agents.get(hireId);
-                                if (hireState) { hireState.x = spawnX; hireState.y = spawnY; }
+                                const hireTools = ['code_execute', 'web_search', 'write_note', 'create_task', 'complete_task'];
+                                const parsedSkills = hireParams.skills ? hireParams.skills.split(',').map((s: string) => s.trim()) : [];
 
-                                const hireAgent = new Agent({
-                                    id: hireId, name: hireName, role: hireRole, avatar: 'sprite.png',
-                                    inference: {
-                                        provider: 'ollama',
-                                        model: 'llama3.2:latest',
-                                        systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
-                                    },
-                                    personality: {
-                                        traits: { openness: 0.9, conscientiousness: 0.7, extraversion: 0.8, agreeableness: 0.9, neuroticism: 0.2 },
-                                        communicationStyle: hireRole.includes('Design') ? 'creative' : 'casual',
-                                        workHours: { start: '09:00', end: '17:00' },
-                                        breakFrequency: 90
-                                    },
-                                    capabilities: [
-                                        { name: 'code_execute', description: 'Execute JavaScript code' },
-                                        { name: 'web_search', description: 'Search the web' },
-                                        { name: 'write_note', description: 'Write a note' },
-                                        { name: 'create_task', description: 'Create a task for the team' }
-                                    ],
-                                    memory: { shortTermLimit: 50 }
-                                });
+                                const hireProfile: PersistedAgentProfile = {
+                                    id: hireId,
+                                    name: hireName,
+                                    role: hireRole,
+                                    avatar: `char_${(this.hireCount + 2) % 6}`,
+                                    x: spawnX,
+                                    y: spawnY,
+                                    provider: 'ollama',
+                                    model: 'llama3.2:latest',
+                                    systemPrompt: `You are ${hireName}, a ${hireRole} who just joined the team at a virtual office. You were hired by ${coreAgent.config.name}. Be enthusiastic, helpful, and eager to learn. Introduce yourself to your colleagues. Keep thoughts SHORT.`,
+                                    communicationStyle: hireRole.includes('Design') ? 'creative' : 'casual',
+                                    skills: parsedSkills,
+                                    allowedTools: hireTools
+                                };
 
-                                hireAgent.setInferenceAdapter(this.ollamaAdapter);
-                                await hireAgent.initialize();
-                                this.coreAgents.set(hireId, hireAgent);
-                                this.thinkingLocks.set(hireId, false);
+                                await this.spawnAgentFromProfile(hireProfile);
+                                await this.memoryStore.saveAgentProfile(hireProfile);
+
+                                const hireAgent = this.coreAgents.get(hireId);
+                                if (hireAgent) {
+                                    hireAgent.addMemory({
+                                        content: `I was hired by ${coreAgent.config.name} as a ${hireRole}.`,
+                                        type: 'achievement',
+                                        timestamp: this.state.officeTime,
+                                        importance: 0.9
+                                    });
+                                }
 
                                 this.hireCount++;
                                 this.rebuildRelationshipGraph();
 
+                                this.broadcast('agent-profiles-sync', Array.from(this.agentProfiles.values()));
                                 this.broadcast('chat', {
                                     sender: '🏢 Office',
                                     text: `🎉 ${coreAgent.config.name} hired ${hireName} as ${hireRole}! Welcome to the team!`
@@ -391,10 +683,15 @@ export class OfficeRoom extends Room<OfficeState> {
                                 });
                             }
                         } else {
-                            const result = await this.toolExecutor.execute(
-                                decision.toolCall.name,
-                                decision.toolCall.params
-                            );
+                            let result: ToolResult;
+                            try {
+                                result = await this.toolExecutor.execute(
+                                    decision.toolCall.name,
+                                    decision.toolCall.params
+                                );
+                            } catch (err: any) {
+                                result = { success: false, output: '', error: err?.message || 'Tool execution error' };
+                            }
 
                             this.broadcast('chat', {
                                 sender: coreAgent.config.name,
@@ -749,6 +1046,9 @@ export class OfficeRoom extends Room<OfficeState> {
         });
         client.send('relationship-update', this.buildRelationshipPayload());
         client.send('layout-sync', { name: 'default', layout: this.currentLayout });
+        client.send('skills-sync', this.skillRegistry.getAll());
+        client.send('tools-sync', this.toolRegistry.getAll());
+        client.send('agent-profiles-sync', Array.from(this.agentProfiles.values()));
     }
 
     onLeave(client: Client, consented: boolean) {
@@ -758,6 +1058,12 @@ export class OfficeRoom extends Room<OfficeState> {
     async onDispose() {
         console.log("room", this.roomId, "disposing... saving memories");
         OfficeRoom.activeRoom = null;
+        if ((this as any)._simulationInterval) {
+            clearInterval((this as any)._simulationInterval);
+        }
+        if (this.clock) {
+            this.clock.clear();
+        }
         // Persist all agent memories on shutdown
         for (const [id, agent] of this.coreAgents) {
             await this.memoryStore.saveMemories(id, agent.memories, this.sessionId);

@@ -34,7 +34,7 @@ type("number")(AgentState.prototype, "momentum");
 
 
 export class OfficeState extends Schema {
-    declare agents: MapSchema<AgentState>;
+    agents: MapSchema<AgentState> = new MapSchema<AgentState>();
     declare officeTime: string;
     declare timeScale: number;
 }

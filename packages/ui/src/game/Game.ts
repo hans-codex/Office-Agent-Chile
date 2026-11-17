@@ -50,14 +50,12 @@ export class OfficeScene extends Phaser.Scene {
     }
 
     preload() {
-        this.load.spritesheet('char_0', '/assets/characters/char_0.png', {
-            frameWidth: 16,
-            frameHeight: 32
-        });
-        this.load.spritesheet('char_1', '/assets/characters/char_1.png', {
-            frameWidth: 16,
-            frameHeight: 32
-        });
+        for (let i = 0; i <= 5; i++) {
+            this.load.spritesheet(`char_${i}`, `/assets/characters/char_${i}.png`, {
+                frameWidth: 16,
+                frameHeight: 32
+            });
+        }
     }
 
     create() {
@@ -69,20 +67,16 @@ export class OfficeScene extends Phaser.Scene {
 
             let hasAnims = false;
 
-            // Create animations for character 0
-            if (this.textures.exists('char_0')) {
-                const anims = this.anims;
-                anims.create({ key: 'char_0-walk-down', frames: anims.generateFrameNumbers('char_0', { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_0-walk-up', frames: anims.generateFrameNumbers('char_0', { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_0-walk-right', frames: anims.generateFrameNumbers('char_0', { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
-                hasAnims = true;
-            }
-            // Create animations for character 1
-            if (this.textures.exists('char_1')) {
-                const anims = this.anims;
-                anims.create({ key: 'char_1-walk-down', frames: anims.generateFrameNumbers('char_1', { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_1-walk-up', frames: anims.generateFrameNumbers('char_1', { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
-                anims.create({ key: 'char_1-walk-right', frames: anims.generateFrameNumbers('char_1', { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
+            // Create animations for all 6 characters (char_0 to char_5)
+            for (let i = 0; i <= 5; i++) {
+                const key = `char_${i}`;
+                if (this.textures.exists(key)) {
+                    const anims = this.anims;
+                    anims.create({ key: `${key}-walk-down`, frames: anims.generateFrameNumbers(key, { start: 0, end: 2 }), frameRate: 8, repeat: -1 });
+                    anims.create({ key: `${key}-walk-up`, frames: anims.generateFrameNumbers(key, { start: 7, end: 9 }), frameRate: 8, repeat: -1 });
+                    anims.create({ key: `${key}-walk-right`, frames: anims.generateFrameNumbers(key, { start: 14, end: 16 }), frameRate: 8, repeat: -1 });
+                    hasAnims = true;
+                }
             }
 
             console.log("Animations created: ", hasAnims);
@@ -487,7 +481,26 @@ export class OfficeScene extends Phaser.Scene {
             document.addEventListener('keydown', keyDownHandler, { capture: true });
             document.addEventListener('keyup', keyUpHandler, { capture: true });
             window.addEventListener('blur', () => this.heldMoveKeys.clear());
+
+            const handleCameraFocus = (e: Event) => {
+                const detail = (e as CustomEvent).detail;
+                if (detail?.id) {
+                    const container = this.agentSprites.get(detail.id);
+                    if (container) {
+                        if (this.followTarget) {
+                            const prevRing = this.followTarget.getAt(0) as Phaser.GameObjects.Graphics;
+                            prevRing?.setVisible(false);
+                        }
+                        this.followTarget = container;
+                        this.cinematicReleaseAt = Date.now() + 15000;
+                        const ring = container.getAt(0) as Phaser.GameObjects.Graphics;
+                        ring?.setVisible(true);
+                    }
+                }
+            };
+            eventBus.addEventListener('focus-camera', handleCameraFocus);
             this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+                eventBus.removeEventListener('focus-camera', handleCameraFocus);
                 window.removeEventListener('keydown', keyDownHandler, true);
                 window.removeEventListener('keyup', keyUpHandler, true);
                 document.removeEventListener('keydown', keyDownHandler, true);
@@ -545,9 +558,8 @@ export class OfficeScene extends Phaser.Scene {
                     console.log(`[Colyseus] Agent added: ${agent.name} at (${agent.x}, ${agent.y})`);
                     const container = this.add.container(agent.x * 16, agent.y * 16);
 
-                    let sprite;
-                    let charKey = 'char_0';
-                    if (agent.name.includes('Bob')) charKey = 'char_1';
+                    let charKey = (agent.avatar && this.textures.exists(agent.avatar)) ? agent.avatar : 'char_0';
+                    let sprite: Phaser.GameObjects.Sprite | Phaser.GameObjects.Rectangle;
 
                     if (this.textures.exists(charKey)) {
                         sprite = this.add.sprite(0, -8, charKey, 0);
@@ -613,6 +625,20 @@ export class OfficeScene extends Phaser.Scene {
                     let lastAction = '';
 
                     agent.onChange(() => {
+                        // Dynamically update sprite texture if agent.avatar changes
+                        const nextAvatar = (agent.avatar && this.textures.exists(agent.avatar)) ? agent.avatar : 'char_0';
+                        if (nextAvatar !== charKey) {
+                            charKey = nextAvatar;
+                            if (sprite.type === 'Sprite') {
+                                (sprite as Phaser.GameObjects.Sprite).setTexture(charKey, 0);
+                            }
+                        }
+
+                        // Update label if name changed
+                        if (agent.name && label.text !== agent.name) {
+                            label.setText(agent.name);
+                        }
+
                         this.tweens.add({
                             targets: container,
                             x: agent.x * 16,

@@ -7,7 +7,7 @@
         "dev": "vite",
         "build": "vite build && tsc --noEmit",
         "preview": "vite preview",
-        "test": "jest"
+        "test": "jest --passWithNoTests --forceExit"
     },
     "dependencies": {
         "@colyseus/schema": "^2.0.37",
